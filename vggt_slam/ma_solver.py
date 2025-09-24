@@ -7,6 +7,7 @@ import open3d as o3d
 import viser
 import viser.transforms as viser_tf
 from termcolor import colored
+import os
 
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from vggt.utils.load_fn import load_and_preprocess_images
@@ -18,6 +19,13 @@ from vggt_slam.map import GraphMap
 from vggt_slam.submap import Submap
 from vggt_slam.h_solve import ransac_projective
 from vggt_slam.gradio_viewer import TrimeshViewer
+
+from collections import defaultdict
+from typing import List, Dict
+
+import sys
+sys.path.append("/home/srujan/work/map-anything")
+from mapanything.utils.image import load_images
 
 # numpy pretty print options
 np.set_printoptions(precision=4, suppress=True)
@@ -283,21 +291,64 @@ class Solver:
             prior_submap = self.map.get_submap(prior_pcd_num)
 
             current_pts = world_points[0,...].reshape(-1, 3)
-        
+
             # TODO conf should be using the threshold in its own submap
             good_mask = self.prior_conf > prior_submap.get_conf_threshold() * (conf[0,...,:].reshape(-1) > prior_submap.get_conf_threshold())
-            
+
+            # Keep original world points to prevent scale accumulation
+            world_points_original = world_points.copy()
+
             if self.use_sim3:
-                # Note we still use H and not T in variable names so we can share code with the Sim3 case, 
+                # Note we still use H and not T in variable names so we can share code with the Sim3 case,
                 # and SIM3 and SE3 are also subsets of the SL4 group
+
                 R_temp = prior_submap.poses[prior_submap.get_last_non_loop_frame_index()][0:3,0:3]
                 t_temp = prior_submap.poses[prior_submap.get_last_non_loop_frame_index()][0:3,3]
                 T_temp = np.eye(4)
                 T_temp[0:3,0:3] = R_temp
                 T_temp[0:3,3] = t_temp
                 T_temp = np.linalg.inv(T_temp)
-                scale_factor = np.mean(np.linalg.norm((T_temp[0:3,0:3] @ self.prior_pcd[good_mask].T).T + T_temp[0:3,3], axis=1) / np.linalg.norm(current_pts[good_mask], axis=1))
-                print(colored("scale factor", 'green'), scale_factor)
+
+                # Transform prior points to current frame
+                transformed_prior = (T_temp[0:3,0:3] @ self.prior_pcd[good_mask].T).T + T_temp[0:3,3]
+                prior_norms = np.linalg.norm(transformed_prior, axis=1)
+                current_norms = np.linalg.norm(current_pts[good_mask], axis=1)
+
+                # Check for problematic ratios with better outlier handling
+                # Filter out points that are too close to origin (unreliable)
+                min_distance = 0.1  # Minimum distance threshold
+                valid_mask = (prior_norms > min_distance) & (current_norms > min_distance)
+
+                if valid_mask.sum() < 100:  # Need minimum points for reliable estimate
+                    print(colored("Warning: Too few reliable points for scale estimation, using fallback", 'red'))
+                    scale_factor = 1.0
+                else:
+                    valid_prior = prior_norms[valid_mask]
+                    valid_current = current_norms[valid_mask]
+                    ratios = valid_prior / valid_current
+
+                    # Use robust statistics to handle outliers
+                    median_ratio = np.median(ratios)
+                    mad = np.median(np.abs(ratios - median_ratio))  # Median absolute deviation
+
+                    # Filter outliers using MAD (more robust than std)
+                    outlier_threshold = mad
+                    inlier_mask = np.abs(ratios - median_ratio) < outlier_threshold
+
+                    if inlier_mask.sum() < 50:
+                        print(colored("Warning: Too many outliers, using median", 'yellow'))
+                        scale_factor = median_ratio
+                    else:
+                        clean_ratios = ratios[inlier_mask]
+                        scale_factor = np.median(clean_ratios)  # Use median instead of mean
+
+                    print(f"Scale ratios (before filtering): min={ratios.min():.4f}, max={ratios.max():.4f}, median={np.median(ratios):.4f}")
+                    print(f"Valid points: {valid_mask.sum()}/{len(prior_norms)}, Inliers: {inlier_mask.sum() if 'inlier_mask' in locals() else 'N/A'}")
+                    print(f"MAD: {mad:.4f}, Outlier threshold: {outlier_threshold:.4f}")
+
+                print(colored(f"COMPUTED SCALE FACTOR: {scale_factor}", 'green'))
+                print(colored("=========================", 'cyan'))
+
                 H_relative = np.eye(4)
                 H_relative[0:3,0:3] = R_temp
                 H_relative[0:3,3] = t_temp
@@ -323,6 +374,7 @@ class Solver:
 
             non_lc_frame = self.current_working_submap.get_last_non_loop_frame_index()
             pts_cam0_camn = world_points[non_lc_frame,...].reshape(-1, 3)
+
             self.prior_pcd = pts_cam0_camn
             self.prior_conf = conf[non_lc_frame,...].reshape(-1)
 
@@ -334,19 +386,10 @@ class Solver:
 
             print("added between factor", prior_pcd_num, new_pcd_num, H_relative)
 
-        # Create and add submap.
-        print(f"Final H_w_submap:\n{H_w_submap}")
-        print(f"Final cam_to_world translations: {cam_to_world[:3, :3, 3] if cam_to_world.shape[0] >= 3 else cam_to_world[:, :3, 3]}")
-        print(f"Final world_points range: min={world_points.min():.4f}, max={world_points.max():.4f}")
-
-        # Create and add submap.
         self.current_working_submap.set_reference_homography(H_w_submap)
         self.current_working_submap.add_all_poses(cam_to_world)
         self.current_working_submap.add_all_points(world_points, colors, conf, self.init_conf_threshold, intrinsics_cam)
         self.current_working_submap.set_conf_masks(conf) # TODO should make this work for point cloud conf as well
-
-        print(f"Submap {self.current_working_submap.get_id()} reference homography:\n{self.current_working_submap.get_reference_homography()}")
-        print(colored("=== ADD_POINTS DEBUG END ===", 'red'))
 
         # Add in loop closures if any were detected.
         for index, loop in enumerate(detected_loops):
@@ -406,7 +449,7 @@ class Solver:
         pixel_coords = torch.stack((y_coords, x_coords), dim=1)
         return pixel_coords
 
-    def run_predictions(self, image_names, model, max_loops):
+    def run_predictions(self, image_names, model, max_loops, args=None):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         images = load_and_preprocess_images(image_names, rotate=270).to(device)
         print(f"Preprocessed images shape: {images.shape}")
@@ -421,6 +464,7 @@ class Solver:
         new_submap.add_all_frames(images)
         new_submap.set_frame_ids(image_names)
         new_submap.set_all_retrieval_vectors(self.image_retrieval.get_all_submap_embeddings(new_submap))
+
         print(colored(">>>> Frame ids in new submap:", "blue"), new_submap.get_frame_ids())
         # TODO implement this
         detected_loops = self.image_retrieval.find_loop_closures(self.map, new_submap, max_loop_closures=max_loops)
@@ -429,6 +473,12 @@ class Solver:
         retrieved_frames = self.map.get_frames_from_loops(detected_loops)
         retrieval_frame_ids = self.map.get_frame_ids_from_loops(detected_loops)
         print(colored("retrieval_frame_ids", "green"), retrieval_frame_ids)
+
+        base_name = image_names[0].split("/")[:-1]
+        base_name = "/".join(base_name) + "/"
+        retrieved_frame_names = []
+        for frame_ids in retrieval_frame_ids:
+            retrieved_frame_names.extend([base_name + f"{int(frame_id):06d}.png" for frame_id in frame_ids])
 
         num_loop_frames = len(retrieved_frames)
         new_submap.set_last_non_loop_frame_index(images.shape[0] - 1)
@@ -439,21 +489,222 @@ class Solver:
             # TODO we don't really need to store the loop closure frame again, but this makes lookup easier for the visualizer.
             # We added the frame to the submap once before to get the retrieval vectors,
             new_submap.add_all_frames(images)
-            image_names = retrieval_frame_ids + image_names
-
-        self.current_working_submap = new_submap
+            image_names = retrieved_frame_names + image_names
         print(">>>>>>>> len(images)", len(images), " ----------- len(image_names)", len(image_names))
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=dtype):
-                predictions = model(images)
+        self.current_working_submap = new_submap
 
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
-        predictions["extrinsic"] = extrinsic
-        predictions["intrinsic"] = intrinsic
-        predictions["detected_loops"] = detected_loops
+        if args is None:
+            # plot all images in a grid
+            num_images = images.shape[0]
+            num_cols = 5
+            num_rows = (num_images + num_cols - 1) // num_cols + 1
+            fig, axes = plt.subplots(num_rows, num_cols, figsize=(15, 3 * num_rows))
+            for i in range(num_rows):
+                for j in range(num_cols):
+                    idx = i * num_cols + j
+                    if idx < num_images:
+                        axes[i, j].imshow(images[idx].cpu().numpy().transpose(1, 2, 0))
+                        axes[i, j].set_title(f"Image {idx}")
+                        axes[i, j].axis("off")
+                    else:
+                        axes[i, j].axis("off")
+            plt.tight_layout()
+            plt.show()
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=dtype):
+                    predictions = model(images)
 
-        for key in predictions.keys():
-            if isinstance(predictions[key], torch.Tensor):
-                predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
+            predictions["extrinsic"] = extrinsic
+            predictions["intrinsic"] = intrinsic
+            predictions["detected_loops"] = detected_loops
 
-        return predictions
+            for key in predictions.keys():
+                if isinstance(predictions[key], torch.Tensor):
+                    predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+
+            # DEBUG: Print VGGT predictions to understand what it returns
+            print(colored("=== VGGT PREDICTIONS DEBUG ===", 'yellow'))
+            print(f"VGGT prediction keys: {list(predictions.keys())}")
+            for key, value in predictions.items():
+                if isinstance(value, np.ndarray):
+                    print(f"{key}: shape={value.shape}, dtype={value.dtype}")
+            print(colored("==============================", 'yellow'))
+
+            return predictions # keys: dict_keys(['frame_id', 'submap_id', 'local_pose', 'image', 'points_3d', 'intrinsics', 'conf_mask'])
+
+        else: # USING MapAnything instead of VGGT
+            
+            views = load_images(image_names, rotate=270)
+
+            # # Plot all images in views as subplots,
+            # images = [img.cpu().numpy() for img in images] # list of (3, H, W) arrays
+            
+            # # Combine views and images for plotting
+            # all_images_to_plot = []
+            
+            # # Process views
+            # for i, view in enumerate(views):
+            #     img = view['img']
+            #     if len(img.shape) == 4:  # 1, 3, H, W
+            #         img = img[0]
+            #     if isinstance(img, torch.Tensor):
+            #         img = img.permute(1, 2, 0)  # H, W, 3
+            #     else:
+            #         img = img.transpose(1, 2, 0)  # H, W, 3
+                
+            #     # Normalize to [0, 255]
+            #     img = (img - img.min()) / (img.max() - img.min()) * 255.0
+            #     if isinstance(img, torch.Tensor):
+            #         img = img.cpu().numpy()
+            #     img = img.astype(np.uint8)
+                
+            #     all_images_to_plot.append(img)
+            
+            # # Process images
+            # for i, img in enumerate(images):
+            #     if isinstance(img, torch.Tensor):
+            #         img = img.cpu().numpy()
+                
+            #     # Convert from (3, H, W) to (H, W, 3)
+            #     if img.shape[0] == 3:
+            #         img = img.transpose(1, 2, 0)
+                
+            #     # Normalize to [0, 255]
+            #     img = (img - img.min()) / (img.max() - img.min()) * 255.0
+            #     img = img.astype(np.uint8)
+                
+            #     # # Rotate 90 degrees anticlockwise
+            #     # img = np.rot90(img, k=1)
+                
+            #     all_images_to_plot.append(img)
+            
+            # # Plot with num_views columns
+            # num_views = len(views)
+            # num_total = len(all_images_to_plot)
+            # num_rows = (num_total + num_views - 1) // num_views  # Ceiling division
+            
+            # fig, axes = plt.subplots(num_rows, num_views, figsize=(num_views * 4, num_rows * 6))
+            
+            # # Handle case where we have only one row
+            # if num_rows == 1:
+            #     axes = axes.reshape(1, -1)
+            # elif num_views == 1:
+            #     axes = axes.reshape(-1, 1)
+            
+            # for i, img in enumerate(all_images_to_plot):
+            #     row = i // num_views
+            #     col = i % num_views
+            #     axes[row, col].imshow(img)
+            #     axes[row, col].axis('off')
+            #     if i < len(views):
+            #         axes[row, col].set_title(f'View {i+1}')
+            #     else:
+            #         axes[row, col].set_title(f'Image {i-len(views)+1}')
+            
+            # # Hide empty subplots
+            # for i in range(num_total, num_rows * num_views):
+            #     row = i // num_views
+            #     col = i % num_views
+            #     axes[row, col].axis('off')
+            
+            # plt.tight_layout()
+            # plt.show()
+
+
+            with torch.no_grad():
+                outputs = model.infer(
+                    views, memory_efficient_inference=args.memory_efficient_inference
+                    )
+
+
+                predictions = {}
+
+                # Initialize lists to collect data from all outputs
+                all_images = []
+                all_world_points = []
+                all_world_points_conf = []
+                all_depth = []
+                all_depth_conf = []
+                all_extrinsics = []
+                all_intrinsics = []
+
+                for output in outputs:
+                    # Extract batch data and squeeze batch dimension if B=1
+                    images_batch = output['img_no_norm'].permute(0, 3, 1, 2).cpu().numpy()  # (B, 3, H, W)
+                    world_points_batch = output['pts3d'].cpu().numpy()  # (B, H, W, 3)
+                    conf_batch = output['conf'].cpu().numpy()  # (B, H, W)
+                    depth_batch = output['depth_z'].cpu().numpy()  # (B, H, W, 1)
+
+                    # Camera poses from MapAnything are world-to-camera, need camera-to-world
+                    camera_poses_batch = output['camera_poses'].cpu().numpy()  # (B, 4, 4)
+                    intrinsics_batch = output['intrinsics'].cpu().numpy()  # (B, 3, 3)
+
+                    # Process each item in the batch
+                    for i in range(images_batch.shape[0]):
+                        all_images.append(images_batch[i])  # (3, H, W)
+                        all_depth.append(depth_batch[i])  # (H, W, 1)
+                        all_depth_conf.append(conf_batch[i])  # (H, W)
+
+                        # CRITICAL FIX: Convert camera poses properly
+                        # MapAnything gives world-to-camera, but VGGT-SLAM expects camera-to-world
+                        cam_pose_4x4 = camera_poses_batch[i]  # (4, 4) world-to-camera
+                        cam_to_world = np.linalg.inv(cam_pose_4x4)  # Invert to get camera-to-world
+                        all_extrinsics.append(cam_to_world[:3, :4])  # (3, 4)
+                        all_intrinsics.append(intrinsics_batch[i])  # (3, 3)
+
+                        # MAJOR FIX: Don't use MapAnything's pts3d directly!
+                        # Instead, compute world points from depth + camera pose like VGGT does
+                        # This ensures consistent coordinate systems
+                        depth_map = depth_batch[i]  # (H, W, 1)
+                        K = intrinsics_batch[i]  # (3, 3)
+                        cam_to_world_3x4 = cam_to_world[:3, :4]  # (3, 4)
+
+                        # Compute world points using the same method as VGGT
+                        world_pts = unproject_depth_map_to_point_map(
+                            depth_map[np.newaxis, :, :, :],  # Add batch dim (1, H, W, 1)
+                            cam_to_world_3x4[np.newaxis, :, :],  # Add batch dim (1, 3, 4)
+                            K[np.newaxis, :, :]  # Add batch dim (1, 3, 3)
+                        )[0]  # Remove batch dim -> (H, W, 3)
+
+                        all_world_points.append(world_pts)
+                        all_world_points_conf.append(conf_batch[i])  # (H, W)
+
+                # Convert lists to numpy arrays with correct shapes for VGGT-SLAM
+                predictions["images"] = np.stack(all_images, axis=0)  # (S, 3, H, W)
+                predictions["world_points"] = np.stack(all_world_points, axis=0)  # (S, H, W, 3)
+                predictions["world_points_conf"] = np.stack(all_world_points_conf, axis=0)  # (S, H, W)
+                predictions["depth"] = np.stack(all_depth, axis=0)  # (S, H, W, 1)
+                predictions["depth_conf"] = np.stack(all_depth_conf, axis=0)  # (S, H, W)
+                predictions["extrinsic"] = np.stack(all_extrinsics, axis=0)  # (S, 3, 4)
+                predictions["intrinsic"] = np.stack(all_intrinsics, axis=0)  # (S, 3, 3)
+                predictions["detected_loops"] = detected_loops
+                predictions["outputs"] = outputs
+
+                # # DEBUG: Print MapAnything data characteristics
+                # print(colored("=== MAPANYTHING DATA DEBUG ===", 'magenta'))
+                # print(f"Input image names: {image_names}")
+                # print(f"Number of MapAnything outputs: {len(outputs)}")
+                # print(f"Images shape: {predictions['images'].shape}")
+                # print(f"World points shape: {predictions['world_points'].shape}")
+                # print(f"Extrinsics shape: {predictions['extrinsic'].shape}")
+
+                # Check world points statistics
+                wp = predictions["world_points"]
+                # print(f"World points stats: min={wp.min():.4f}, max={wp.max():.4f}, mean={wp.mean():.4f}")
+                # print(f"World points norms: min={np.linalg.norm(wp.reshape(-1, 3), axis=1).min():.4f}, max={np.linalg.norm(wp.reshape(-1, 3), axis=1).max():.4f}, mean={np.linalg.norm(wp.reshape(-1, 3), axis=1).mean():.4f}")
+
+                # Check camera poses
+                ext = predictions["extrinsic"]
+                # print(f"Camera positions (first 3): {ext[:3, :3, 3]}")
+                # print(f"Camera translation norms: {np.linalg.norm(ext[:, :3, 3], axis=1)}")
+
+                # Check depth statistics
+                depth = predictions["depth"]
+                # print(f"Depth stats: min={depth.min():.4f}, max={depth.max():.4f}, mean={depth.mean():.4f}")
+                # print(f"Depth range per image: {[f'{depth[i].min():.2f}-{depth[i].max():.2f}' for i in range(min(3, depth.shape[0]))]}")
+
+                print(colored("==============================", 'magenta'))
+
+                return predictions

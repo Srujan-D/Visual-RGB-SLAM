@@ -113,6 +113,11 @@ class Submap:
     def get_frame_ids(self):
         # Note this does not include any of the loop closure frames
         return self.frame_ids
+    
+    def get_frame_ids_at_indices(self, indices):
+        if isinstance(indices, np.int64) or isinstance(indices, int):
+            return [self.frame_ids[indices]]
+        return [self.frame_ids[i] for i in indices]
 
     def filter_data_by_confidence(self, data, stride = 1):
         if stride == 1:

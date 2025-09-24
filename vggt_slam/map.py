@@ -63,6 +63,13 @@ class GraphMap:
         
         return frames
     
+    def get_frame_ids_from_loops(self, loops):
+        frame_ids = []
+        for detected_loop in loops:
+            frame_ids.append(self.submaps[detected_loop.detected_submap_id].get_frame_ids_at_indices(detected_loop.detected_submap_frame))
+
+        return frame_ids
+    
     def update_submap_homographies(self, graph):
         for submap_key in self.submaps.keys():
             submap = self.submaps[submap_key]

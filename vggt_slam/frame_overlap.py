@@ -135,8 +135,11 @@ class FrameTracker:
         if self.last_kf is None or self.kf_pts is None or len(self.kf_pts) < 10:
             self.initialize_keyframe(image)
             return True
-
-        curr_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        try:
+            curr_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        except:
+            print("Error converting image to grayscale")
+            return False
 
         # Track keyframe points into current frame
         next_pts, status, _ = cv2.calcOpticalFlowPyrLK(

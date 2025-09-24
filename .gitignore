@@ -170,3 +170,8 @@ dmypy.json
 **/tmp/
 **/outputs/skyseg.onnx
 skyseg.onnx
+vggt_results/
+data/
+mapanything_slam_results/
+test_memory_efficiency.py
+MEMORY_OPTIMIZATION.md
